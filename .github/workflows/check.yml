@@ -1,0 +1,64 @@
+name: Check apps and server
+
+# Green = the latest release has all APKs, correctly signed with the shop key,
+#         and the shop server answers on the internet with its database connected.
+# Runs when a new release is published, every 5 hours, and on demand (Run workflow button).
+on:
+  release:
+    types: [published, edited]
+  schedule:
+    - cron: "0 */5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SERVER_URL: https://script-tarmac-purchase.ngrok-free.dev
+  SIGNER_SHA256: 6a6a4c6eda0497a4d7cad87c89c431bf7d187f47c60d31dedcb25d8217956a2d
+
+jobs:
+  apks:
+    name: APKs in latest release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern '*.apk' --dir apks
+          ls -la apks
+      - name: Check every app is there and signed with the shop key
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          for f in bingwa-wa-viatu.apk bwv-staff.apk; do
+            [ -f "apks/$f" ] || { echo "::error::$f is missing from the latest release"; exit 1; }
+          done
+          for f in apks/*.apk; do
+            pkg=$("$BT/aapt" dump badging "$f" | grep -oP "^package: name='\K[^']+")
+            sig=$("$BT/apksigner" verify --print-certs "$f" | grep -m1 -oP 'SHA-256 digest: \K.*')
+            echo "$(basename "$f"): $pkg  $(du -h "$f" | cut -f1)"
+            [ "$sig" = "$SIGNER_SHA256" ] || { echo "::error::$(basename "$f") is not signed with the shop key"; exit 1; }
+          done
+          {
+            echo "### Downloads (latest)"
+            for f in apks/*.apk; do n=$(basename "$f"); echo "- [$n](https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$n)"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  server:
+    name: Shop server is live
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check (retries for 3 minutes)
+        run: |
+          for i in $(seq 1 12); do
+            out=$(curl -s -m 20 -H "ngrok-skip-browser-warning: 1" "$SERVER_URL/api/health" || true)
+            echo "$out"
+            if echo "$out" | grep -q '"db_ok": true'; then
+              echo "### Server live: $SERVER_URL (database connected)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Server not reachable or database offline. Is the laptop on and online?"
+          exit 1
